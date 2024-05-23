@@ -2,7 +2,6 @@
 #include <iostream>
 #include <lpp/location_information.h>
 #include <lpp/lpp.h>
-#include <modem.h>
 #include <receiver/nmea/threaded_receiver.hpp>
 #include <receiver/ublox/threaded_receiver.hpp>
 #include <sstream>
@@ -35,7 +34,12 @@ static bool                gForceIodeContinuity;
 static bool                gAverageZenithDelay;
 static bool                gEnableIodeShift;
 static int                 gSf055Override;
+static int                 gSf055Default;
+static int                 gSf042Override;
+static int                 gSf042Default;
 static bool                gIncreasingSiou;
+static bool                gFilterByOcb;
+static bool                gIgnoreL2L;
 static bool                gPrintRtcm;
 static Options             gOptions;
 static ControlParser       gControlParser;
@@ -48,7 +52,6 @@ static SPARTN_Generator gSpartnGeneratorOld;
 static generator::spartn::Generator gSpartnGeneratorNew;
 #endif
 
-static std::unique_ptr<Modem_AT>  gModem;
 static std::unique_ptr<UReceiver> gUbloxReceiver;
 static std::unique_ptr<NReceiver> gNmeaReceiver;
 
@@ -57,7 +60,9 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
 [[noreturn]] void execute(Options options, ssr_example::Format format, int ura_override,
                           bool ublox_clock_correction, bool force_continuity,
                           bool average_zenith_delay, bool enable_iode_shift, int sf055_override,
-                          bool increasing_siou, bool print_rtcm) {
+                          int sf055_default, int sf042_override, int sf042_default,
+                          bool increasing_siou, bool filter_by_ocb, bool ignore_l2l,
+                          bool print_rtcm) {
     gOptions              = std::move(options);
     gFormat               = format;
     gUraOverride          = ura_override;
@@ -66,13 +71,17 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
     gAverageZenithDelay   = average_zenith_delay;
     gEnableIodeShift      = enable_iode_shift;
     gSf055Override        = sf055_override;
+    gSf055Default         = sf055_default;
+    gSf042Override        = sf042_override;
+    gSf042Default         = sf042_default;
     gIncreasingSiou       = increasing_siou;
+    gFilterByOcb          = filter_by_ocb;
+    gIgnoreL2L            = ignore_l2l;
     gPrintRtcm            = print_rtcm;
 
     auto& cell_options                 = gOptions.cell_options;
     auto& location_server_options      = gOptions.location_server_options;
     auto& identity_options             = gOptions.identity_options;
-    auto& modem_options                = gOptions.modem_options;
     auto& output_options               = gOptions.output_options;
     auto& ublox_options                = gOptions.ublox_options;
     auto& nmea_options                 = gOptions.nmea_options;
@@ -92,7 +101,9 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
     printf("  location server:    \"%s:%d\" %s\n", location_server_options.host.c_str(),
            location_server_options.port, location_server_options.ssl ? "[ssl]" : "");
     printf("  identity:           ");
-    if (identity_options.imsi)
+    if (identity_options.wait_for_identity)
+        printf("identity from control\n");
+    else if (identity_options.imsi)
         printf("imsi: %llu\n", *identity_options.imsi);
     else if (identity_options.msisdn)
         printf("msisdn: %llu\n", *identity_options.msisdn);
@@ -102,14 +113,6 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
         printf("none\n");
     printf("  cell information:   %s %ld:%ld:%ld:%llu (mcc:mnc:tac:id)\n",
            cell_options.is_nr ? "[nr]" : "[lte]", gCell.mcc, gCell.mnc, gCell.tac, gCell.cell);
-
-    if (modem_options.device) {
-        gModem = std::unique_ptr<Modem_AT>(
-            new Modem_AT(modem_options.device->device, modem_options.device->baud_rate, gCell));
-        if (!gModem->initialize()) {
-            throw std::runtime_error("Unable to initialize modem");
-        }
-    }
 
     for (auto& interface : output_options.interfaces) {
         interface->open();
@@ -159,21 +162,70 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
     } else {
         gSpartnGeneratorNew.set_iode_shift(false);
     }
-    if (gSf055Override >= 0) {
-        gSpartnGeneratorNew.set_ionosphere_quality_override(gSf055Override);
-    }
-    if (gIncreasingSiou) {
-        gSpartnGeneratorNew.set_increasing_siou(true);
-    }
+    if (gSf055Override >= 0) gSpartnGeneratorNew.set_sf055_override(gSf055Override);
+    if (gSf055Default >= 0) gSpartnGeneratorNew.set_sf055_default(gSf055Default);
+    if (gSf042Override >= 0) gSpartnGeneratorNew.set_sf042_override(gSf042Override);
+    if (gSf042Default >= 0) gSpartnGeneratorNew.set_sf042_default(gSf042Default);
+
+    if (gIncreasingSiou) gSpartnGeneratorNew.set_increasing_siou(true);
+    if (gFilterByOcb) gSpartnGeneratorNew.set_filter_by_ocb(true);
+    if (gIgnoreL2L) gSpartnGeneratorNew.set_ignore_l2l(true);
+
 #endif
 
+    LPP_Client::AD_Request request;
     LPP_Client client{false /* experimental segmentation support */};
+    bool client_initialized = false;
+    bool client_got_identity = false;
 
     if (!identity_options.use_supl_identity_fix) {
         client.use_incorrect_supl_identity();
     }
 
-    if (identity_options.imsi) {
+    if (control_options.interface) {
+        printf("[control]\n");
+        control_options.interface->open();
+        control_options.interface->print_info();
+
+        gControlParser.on_cid = [&](CellID cell) {
+            if(!client_initialized) return;
+            if (gCell != cell) {
+                printf("[control] cell: %ld:%ld:%ld:%llu\n", cell.mcc, cell.mnc, cell.tac,
+                       cell.cell);
+                gCell = cell;
+                client.update_assistance_data(request, gCell);
+            } else {
+                printf("[control] cell: %ld:%ld:%ld:%llu (unchanged)\n", cell.mcc, cell.mnc,
+                       cell.tac, cell.cell);
+            }
+        };
+
+        gControlParser.on_identity_imsi = [&](unsigned long long imsi) {
+            printf("[control] identity: imsi: %llu\n", imsi);
+            if(client_got_identity) return;
+            client.set_identity_imsi(imsi);
+            client_got_identity = true;
+        };
+    }
+
+    if(identity_options.wait_for_identity) {
+        if(!control_options.interface) {
+            throw std::runtime_error("No control interface provided");
+        }
+
+        printf("  waiting for identity\n");
+        if(identity_options.imsi || identity_options.msisdn || identity_options.ipv4) {
+            printf("  (imsi, msisdn, or ipv4 identity ignored)\n");
+        }
+        while(!client_got_identity) {
+            struct timespec timeout;
+            timeout.tv_sec  = 0;
+            timeout.tv_nsec = 1000000 * 100;  // 100 ms
+            nanosleep(&timeout, nullptr);
+
+            gControlParser.parse(control_options.interface);
+        }
+    } else if (identity_options.imsi) {
         client.set_identity_imsi(*identity_options.imsi);
     } else if (identity_options.msisdn) {
         client.set_identity_msisdn(*identity_options.msisdn);
@@ -216,29 +268,17 @@ static void assistance_data_callback(LPP_Client*, LPP_Transaction*, LPP_Message*
         printf("  unlock update rate: false\n");
     }
 
-    client.provide_ecid_callback(gModem.get(), provide_ecid_callback);
-
     if (!client.connect(location_server_options.host.c_str(), location_server_options.port,
                         location_server_options.ssl, gCell)) {
         throw std::runtime_error("Unable to connect to location server");
     }
 
-    auto request = client.request_assistance_data_ssr(gCell, nullptr, assistance_data_callback);
+    request = client.request_assistance_data_ssr(gCell, nullptr, assistance_data_callback);
     if (request == AD_REQUEST_INVALID) {
         throw std::runtime_error("Unable to request assistance data");
     }
 
-    if (control_options.interface) {
-        printf("[control]\n");
-        control_options.interface->open();
-        control_options.interface->print_info();
-
-        gControlParser.on_cid = [&](CellID cell) {
-            printf("[control] cell: %ld:%ld:%ld:%llu\n", cell.mcc, cell.mnc, cell.tac, cell.cell);
-            gCell = cell;
-            client.update_assistance_data(request, gCell);
-        };
-    }
+    client_initialized = true;
 
     for (;;) {
         struct timespec timeout;
@@ -266,7 +306,7 @@ static void assistance_data_callback(LPP_Client* client, LPP_Transaction*, LPP_M
             &asn_DEF_LPP_Message, message, XER_F_BASIC,
             [](void const* text_buffer, size_t text_size, void* app_key) -> int {
                 auto string_stream = static_cast<std::ostream*>(app_key);
-                string_stream->write(static_cast<const char*>(text_buffer),
+                string_stream->write(static_cast<char const*>(text_buffer),
                                      static_cast<std::streamsize>(text_size));
                 return 0;
             },
@@ -405,7 +445,12 @@ void SsrCommand::parse(args::Subparser& parser) {
     delete mAverageZenithDelayArg;
     delete mEnableIodeShift;
     delete mSf055Override;
+    delete mSf055Default;
+    delete mSf042Override;
+    delete mSf042Default;
     delete mIncreasingSiou;
+    delete mFilterByOcb;
+    delete mIgnoreL2L;
     delete mPrintRTCMArg;
 
     mFormatArg = new args::ValueFlag<std::string>(parser, "format", "Format of the output",
@@ -452,10 +497,27 @@ void SsrCommand::parse(args::Subparser& parser) {
                                  "Override the SF055 value, value will be clamped between 0-15. "
                                  "Where 0 indicates that the value is invalid.",
                                  {"sf055-override"}, args::Options::Single);
+    mSf055Default =
+        new args::ValueFlag<int>(parser, "sf055-default",
+                                 "Set the default SF055 value, value will be clamped between 0-15. "
+                                 "Where 0 indicates that the value is invalid.",
+                                 {"sf055-default"}, args::Options::Single);
+
+    mSf042Override = new args::ValueFlag<int>(
+        parser, "sf042-override", "Override the SF042 value, value will be clamped between 0-7.",
+        {"sf042-override"}, args::Options::Single);
+    mSf042Default = new args::ValueFlag<int>(
+        parser, "sf042-default", "Set the default SF042 value, value will be clamped between 0-7.",
+        {"sf042-default"}, args::Options::Single);
 
     mIncreasingSiou =
         new args::Flag(parser, "increasing-siou", "Enable the increasing SIoU feature for SPARTN",
                        {"increasing-siou"});
+    mFilterByOcb = new args::Flag(
+        parser, "filter-by-ocb",
+        "Only include ionospheric residual satellites that also have OCB corrections",
+        {"filter-by-ocb"});
+    mIgnoreL2L = new args::Flag(parser, "ignore-l2l", "Ignore L2L biases", {"ignore-l2l"});
 
     mPrintRTCMArg =
         new args::Flag(parser, "print_rtcm", "Print RTCM messages info (only used for LRF-UPER)",
@@ -522,9 +584,40 @@ void SsrCommand::execute(Options options) {
         if (sf055_override > 15) sf055_override = 15;
     }
 
+    auto sf055_default = -1;
+    if (*mSf055Default) {
+        sf055_default = mSf055Default->Get();
+        if (sf055_default < 0) sf055_default = 0;
+        if (sf055_default > 15) sf055_default = 15;
+    }
+
+    auto sf042_override = -1;
+    if (*mSf042Override) {
+        sf042_override = mSf042Override->Get();
+        if (sf042_override < 0) sf042_override = 0;
+        if (sf042_override > 7) sf042_override = 7;
+    }
+
+    auto sf042_default = -1;
+    if (*mSf042Default) {
+        sf042_default = mSf042Default->Get();
+        if (sf042_default < 0) sf042_default = 0;
+        if (sf042_default > 7) sf042_default = 7;
+    }
+
     auto increasing_siou = false;
     if (*mIncreasingSiou) {
         increasing_siou = mIncreasingSiou->Get();
+    }
+
+    auto filter_by_ocb = false;
+    if (*mFilterByOcb) {
+        filter_by_ocb = mFilterByOcb->Get();
+    }
+
+    auto ignore_l2l = false;
+    if (*mIgnoreL2L) {
+        ignore_l2l = mIgnoreL2L->Get();
     }
 
     auto print_rtcm = false;
@@ -533,7 +626,8 @@ void SsrCommand::execute(Options options) {
     }
 
     ::execute(std::move(options), format, ura_override, ublox_clock_correction, force_continuity,
-              average_zenith_delay, iode_shift, sf055_override, increasing_siou, print_rtcm);
+              average_zenith_delay, iode_shift, sf055_override, sf055_default, sf042_override,
+              sf042_default, increasing_siou, filter_by_ocb, ignore_l2l, print_rtcm);
 }
 
 }  // namespace ssr_example

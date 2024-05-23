@@ -13,6 +13,7 @@ option(INTERFACE_FD_DEBUG "Print FD debug information" OFF)
 option(RECEIVER_UBLOX_THREADED "Print Receiver u-blox (threaded) debug information" OFF)
 option(SPARTN_DEBUG_PRINT "Print SPARTN debug information" OFF)
 option(RECEIVER_NMEA_DEBUG "Print Receiver NMEA debug information" OFF)
+option(DEBUG_MODEM "Enable modem debug information" OFF)
 
 option(INCLUDE_GENERATOR_RTCM "Include RTCM generator" ON)
 option(INCLUDE_GENERATOR_SPARTN "Include SPARTN generator" ON)
@@ -36,8 +37,8 @@ find_package(OpenSSL REQUIRED)
 endif (USE_OPENSSL)
 
 add_definitions(-D_POSIX_C_SOURCE=200809L)
-add_definitions(-DCLIENT_VERSION="3.4.8")
-add_definitions(-DCLIENT_VERSION_INT=0x030408)
+add_definitions(-DCLIENT_VERSION="3.4.9")
+add_definitions(-DCLIENT_VERSION_INT=0x030409)
 
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
    add_definitions(-DCOMPILER_CANNOT_DEDUCE_UNREACHABLE=1)

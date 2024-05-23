@@ -2,6 +2,8 @@
 #include <interface/interface.hpp>
 #include <receiver/ublox/receiver.hpp>
 
+#include <math.h>
+
 using namespace interface;
 using namespace receiver::ublox;
 
@@ -16,16 +18,22 @@ static args::Group location_server{
     args::Options::Global,
 };
 
-static args::ValueFlag<std::string> location_server_host{location_server,
-                                                         "host",
-                                                         "Host",
-                                                         {'h', "host"},
-                                                         args::Options::Single |
-                                                             args::Options::Required};
-static args::ValueFlag<uint16_t>    location_server_port{
+static args::ValueFlag<std::string> location_server_host{
+    location_server, "host", "Host", {'h', "host"}, args::Options::Single};
+static args::ValueFlag<uint16_t> location_server_port{
     location_server, "port", "Port", {'p', "port"}, args::Options::Single};
 static args::Flag location_server_ssl{
     location_server, "ssl", "TLS", {'s', "ssl"}, args::Options::Single};
+static args::Flag location_server_slp_host_cell{location_server,
+                                                "slp-host-cell",
+                                                "Use Cell ID as SLP Host",
+                                                {"slp-host-cell"},
+                                                args::Options::Single};
+static args::Flag location_server_slp_host_imsi{location_server,
+                                                "slp-host-imsi",
+                                                "Use IMSI as SLP Host",
+                                                {"slp-host-imsi"},
+                                                args::Options::Single};
 
 //
 // Identity
@@ -46,6 +54,12 @@ static args::Flag                   use_supl_identity_fix{identity,
                                         "Use SUPL Identity Fix",
                                                           {"supl-identity-fix"},
                                         args::Options::Single};
+static args::Flag                   wait_for_identity{
+    identity,
+    "wait-for-identity",
+    "Wait for the identity to be provided via the control interface",
+                      {"wait-for-identity"},
+    args::Options::Single};
 
 //
 // Cell Information
@@ -77,21 +91,6 @@ static args::ValueFlag<unsigned long long> ci{cell_information,
                                               {'i', "ci"},
                                               args::Options::Single | args::Options::Required};
 static args::Flag is_nr{cell_information, "nr", "The cell specified is a 5G NR cell", {"nr"}};
-
-//
-// Modem
-//
-
-static args::Group modem{
-    "Modem:",
-    args::Group::Validators::AllChildGroups,
-    args::Options::Global,
-};
-
-static args::ValueFlag<std::string> modem_device{
-    modem, "device", "Device", {"modem"}, args::Options::Single};
-static args::ValueFlag<int> modem_baud_rate{
-    modem, "baud_rate", "Baud Rate", {"modem-baud"}, args::Options::Single};
 
 //
 // u-blox
@@ -442,11 +441,43 @@ static args::ValueFlag<std::string> ctrl_un_output_path{
 // Options
 //
 
-static LocationServerOptions parse_location_server_options() {
+static LocationServerOptions parse_location_server_options(Options& options) {
     LocationServerOptions location_server_options{};
     location_server_options.host = location_server_host.Get();
     location_server_options.port = 5431;
     location_server_options.ssl  = false;
+
+    if (location_server_host) {
+        location_server_options.host = location_server_host.Get();
+    } else if (location_server_slp_host_imsi) {
+        if (!options.identity_options.imsi) {
+            throw args::RequiredError("`imsi` is required to use `slp-host-imsi`");
+        } else if(options.identity_options.wait_for_identity) {
+            throw args::ValidationError("`slp-host-imsi` cannot be used with `wait-for-identity`");
+        }
+
+        auto imsi   = *options.identity_options.imsi;
+        auto digits = std::to_string(imsi).size();
+        if (digits < 6) {
+            throw args::ValidationError("`imsi` must be at least 6 digits long");
+        }
+
+        auto mcc = (imsi / (unsigned long long)std::pow(10, digits - 3)) % 1000;
+        auto mnc = (imsi / (unsigned long long)std::pow(10, digits - 6)) % 1000;
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer), "h-slp.%03llu.%03llu.pub.3gppnetwork.org", mnc, mcc);
+        auto h_slp                   = std::string{buffer};
+        location_server_options.host = h_slp;
+    } else if (location_server_slp_host_cell) {
+        auto mcc = options.cell_options.mcc;
+        auto mnc = options.cell_options.mnc;
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer), "h-slp.%03d.%03d.pub.3gppnetwork.org", mnc, mcc);
+        auto h_slp                   = std::string{buffer};
+        location_server_options.host = h_slp;
+    } else {
+        throw args::RequiredError("`host` or `slp-host-cell` or `slp-host-imsi` is required");
+    }
 
     if (location_server_port) {
         location_server_options.port = location_server_port.Get();
@@ -462,6 +493,7 @@ static LocationServerOptions parse_location_server_options() {
 static IdentityOptions parse_identity_options() {
     IdentityOptions identity_options{};
     identity_options.use_supl_identity_fix = false;
+    identity_options.wait_for_identity     = false;
 
     if (msisdn) {
         identity_options.msisdn =
@@ -477,7 +509,12 @@ static IdentityOptions parse_identity_options() {
         identity_options.ipv4 = std::unique_ptr<std::string>{new std::string{ipv4.Get()}};
     }
 
-    if (!identity_options.msisdn && !identity_options.imsi && !identity_options.ipv4) {
+    if (wait_for_identity) {
+        identity_options.wait_for_identity = true;
+    }
+
+    if (!identity_options.wait_for_identity && !identity_options.msisdn && !identity_options.imsi &&
+        !identity_options.ipv4) {
         identity_options.imsi =
             std::unique_ptr<unsigned long long>{new unsigned long long{2460813579lu}};
     }
@@ -497,25 +534,6 @@ static CellOptions parse_cell_options() {
     cell_options.cid   = ci.Get();
     cell_options.is_nr = is_nr ? is_nr.Get() : false;
     return cell_options;
-}
-
-static ModemOptions parse_modem_options() {
-    ModemOptions modem_options{};
-
-    if (modem_device || modem_baud_rate) {
-        if (!modem_device) {
-            throw args::RequiredError("modem_device");
-        }
-
-        if (!modem_baud_rate) {
-            throw args::RequiredError("modem_device");
-        }
-
-        modem_options.device = std::unique_ptr<ModemDevice>{
-            new ModemDevice{modem_device.Get(), modem_baud_rate.Get()}};
-    }
-
-    return modem_options;
 }
 
 static OutputOptions parse_output_options() {
@@ -1046,10 +1064,9 @@ int OptionParser::parse_and_execute(int argc, char** argv) {
                 subparser.Parse();
 
                 Options options{};
-                options.location_server_options      = parse_location_server_options();
-                options.identity_options             = parse_identity_options();
                 options.cell_options                 = parse_cell_options();
-                options.modem_options                = parse_modem_options();
+                options.identity_options             = parse_identity_options();
+                options.location_server_options      = parse_location_server_options(options);
                 options.output_options               = parse_output_options();
                 options.ublox_options                = ublox_parse_options();
                 options.nmea_options                 = nmea_parse_options();
@@ -1130,7 +1147,6 @@ int OptionParser::parse_and_execute(int argc, char** argv) {
     args::GlobalOptions location_server_globals{parser, location_server};
     args::GlobalOptions identity_globals{parser, identity};
     args::GlobalOptions cell_information_globals{parser, cell_information};
-    args::GlobalOptions modem_globals{parser, modem};
     args::GlobalOptions ublox_receiver_globals{parser, ublox_receiver_group};
     args::GlobalOptions nmea_receiver_globals{parser, nmea_receiver_group};
     args::GlobalOptions other_receiver_globals{parser, other_receiver_group};
