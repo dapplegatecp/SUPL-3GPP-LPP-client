@@ -3,6 +3,7 @@
 #include "gst.hpp"
 #include "message.hpp"
 #include "vtg.hpp"
+#include "epe.hpp"
 
 #include <cstdio>
 
@@ -140,6 +141,14 @@ std::unique_ptr<Message> Parser::try_parse() NMEA_NOEXCEPT {
             return std::unique_ptr<ErrorMessage>(
                 new ErrorMessage(prefix, data_payload, data_checksum));
         }
+    } else if (prefix == "PQTMEPE") {
+        auto message = EpeMessage::parse(prefix, data_payload, data_checksum);
+        if (message) {
+            return message;
+        } else {
+            return std::unique_ptr<ErrorMessage>(
+                new ErrorMessage(prefix, data_payload, data_checksum));
+        }
     } else {
         return std::unique_ptr<UnsupportedMessage>(
             new UnsupportedMessage(prefix, data_payload, data_checksum));
@@ -200,7 +209,12 @@ ChecksumResult Parser::checksum(std::string const& buffer) {
     auto nmea_string = buffer.substr(1, nmea_end - 1);
 
     auto expected_checksum_hex = buffer.substr(nmea_end + 1, nmea_end + 3);
-    auto expected_checksum     = std::stoull(std::string{expected_checksum_hex}, nullptr, 16);
+    auto expected_checksum     = 0LLU;
+    try {
+        expected_checksum = std::stoull(std::string{expected_checksum_hex}, nullptr, 16);
+    } catch (...) {
+        return ChecksumResult::INVALID_VALUE;
+    }
 
     auto calculated_checksum = 0ULL;
     for (auto nmea_char : nmea_string) {
@@ -226,7 +240,9 @@ std::string Parser::parse_prefix(uint8_t const* data, uint32_t length) const NME
         prefix += static_cast<char>(c);
     }
 
-    if (prefix.size() != 6) {
+    if (prefix.size() != 6 && prefix.size() != 8) {
+        // All NMEA messages have six characters in their prefix, eg $GPGST, except
+        // Quectel's EPE message, that has eight characters: $PQTMEPE.
         return "";
     }
 

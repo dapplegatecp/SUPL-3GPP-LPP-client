@@ -162,6 +162,12 @@ static args::ValueFlag<std::string> ublox_udp_ip_address{
 static args::ValueFlag<uint16_t> ublox_udp_port{
     ublox_udp_device, "port", "Port", {"ublox-udp-port"}, args::Options::Single};
 
+static args::ValueFlag<std::string> ublox_export_file{ublox_receiver_group,
+                                                      "file",
+                                                      "Export UBX messages to file",
+                                                      {"ublox-export-file"},
+                                                      args::Options::Single};
+
 //
 // NMEA
 //
@@ -171,6 +177,9 @@ static args::Group nmea_receiver_group{
     args::Group::Validators::AllChildGroups,
     args::Options::Global,
 };
+
+static args::Flag receiver_readonly{
+    nmea_receiver_group, "readonly", "Readonly Receiver", {"readonly"}, args::Options::Single};
 
 static args::Group nmea_serial_group{
     nmea_receiver_group,
@@ -191,6 +200,29 @@ static args::ValueFlag<std::string> nmea_serial_parity_bits{nmea_receiver_group,
                                                             "Parity Bits",
                                                             {"nmea-serial-parity"},
                                                             args::Options::Single};
+
+static args::Group nmea_tcp_group{
+    nmea_receiver_group,
+    "TCP:",
+    args::Group::Validators::AllOrNone,
+    args::Options::Global,
+};
+static args::ValueFlag<std::string> nmea_tcp_ip_address{
+    nmea_tcp_group, "ip_address", "Host or IP Address", {"nmea-tcp"}, args::Options::Single};
+static args::ValueFlag<uint16_t> nmea_tcp_port{
+    nmea_tcp_group, "port", "Port", {"nmea-tcp-port"}, args::Options::Single};
+
+static args::Group nmea_udp_group{
+    nmea_receiver_group,
+    "UDP:",
+    args::Group::Validators::AllOrNone,
+    args::Options::Global,
+};
+static args::ValueFlag<std::string> nmea_udp_ip_address{
+    nmea_udp_group, "ip_address", "Host or IP Address", {"nmea-udp"}, args::Options::Single};
+static args::ValueFlag<uint16_t> nmea_udp_port{
+    nmea_udp_group, "port", "Port", {"nmea-udp-port"}, args::Options::Single};
+
 // export nmea to unix socket
 static args::ValueFlag<std::string> nmea_export_un{nmea_receiver_group,
                                                    "unix socket",
@@ -204,6 +236,12 @@ static args::ValueFlag<uint16_t> nmea_export_tcp_port{nmea_receiver_group,
                                                       "Export NMEA to TCP Port",
                                                       {"nmea-export-tcp-port"},
                                                       args::Options::Single};
+
+static args::ValueFlag<std::string> nmea_export_file{nmea_receiver_group,
+                                                     "file",
+                                                     "Export NMEA to file",
+                                                     {"nmea-export-file"},
+                                                     args::Options::Single};
 
 //
 // Output
@@ -331,6 +369,12 @@ static args::Flag li_unlocked{
     {"location-report-unlocked"},
     args::Options::Single,
 };
+static args::ValueFlag<int> li_update_rate{
+    location_infomation,
+    "update-rate",
+    "Update rate in milliseconds",
+    {"update-rate"},
+    args::Options::Single};
 static args::ValueFlag<double> li_latitude{location_infomation,
                                            "latitude",
                                            "Fake Latitude",
@@ -346,11 +390,25 @@ static args::ValueFlag<double> li_altitude{location_infomation,
                                            "Fake Altitude",
                                            {"fake-altitude", "falt"},
                                            args::Options::Single};
-static args::Flag              li_conf95to39{location_infomation,
-                                "confidence-95to39",
-                                "Convert 95p confidence to 39p confidence",
-                                             {"confidence-95to39"},
-                                args::Options::Single};
+static args::Flag              li_conf95to39{
+    location_infomation,
+    "confidence-95to39",
+    "DEPRECATED: Convert 95p confidence to 39p confidence (use --confidence-95to68)",
+                 {"confidence-95to39"},
+    args::Options::Single};
+static args::Flag li_conf95to68{
+    location_infomation,
+    "confidence-95to68",
+    "Rescale incoming semi-major/semi-minor axes from 95p to 68p confidence",
+    {"confidence-95to68"},
+    args::Options::Single};
+static args::Flag li_output_ellipse_68{
+    location_infomation,
+    "output-ellipse-68",
+    "Output error ellipse with confidence 68p instead of 39p",
+    {"output-ellipse-68"},
+    args::Options::Single,
+};
 static args::ValueFlag<double> li_override_horizontal_confidence{
     location_infomation,
     "override-horizontal-confidence",
@@ -452,7 +510,7 @@ static LocationServerOptions parse_location_server_options(Options& options) {
     } else if (location_server_slp_host_imsi) {
         if (!options.identity_options.imsi) {
             throw args::RequiredError("`imsi` is required to use `slp-host-imsi`");
-        } else if(options.identity_options.wait_for_identity) {
+        } else if (options.identity_options.wait_for_identity) {
             throw args::ValidationError("`slp-host-imsi` cannot be used with `wait-for-identity`");
         }
 
@@ -592,7 +650,7 @@ static OutputOptions parse_output_options() {
         }
 
         auto interface = interface::Interface::serial(serial_device.Get(), baud_rate, data_bits,
-                                                      stop_bits, parity_bit);
+                                                      stop_bits, parity_bit, false);
         output_options.interfaces.emplace_back(interface);
     }
 
@@ -698,8 +756,13 @@ static std::unique_ptr<Interface> ublox_parse_serial() {
         }
     }
 
-    return std::unique_ptr<Interface>(
-        Interface::serial(ublox_serial_device.Get(), baud_rate, data_bits, stop_bits, parity_bit));
+    auto read_only = false;
+    if (receiver_readonly) {
+        read_only = true;
+    }
+
+    return std::unique_ptr<Interface>(Interface::serial(
+        ublox_serial_device.Get(), baud_rate, data_bits, stop_bits, parity_bit, read_only));
 }
 
 static std::unique_ptr<Interface> ublox_parse_i2c() {
@@ -786,56 +849,109 @@ static UbloxOptions ublox_parse_options() {
         auto port      = ublox_parse_port();
         auto interface = ublox_parse_interface();
         auto prm       = print_receiver_options_parse();
-        return UbloxOptions{port, std::move(interface), prm};
+        auto readonly  = receiver_readonly ? true : false;
+
+        std::vector<std::unique_ptr<interface::Interface>> export_interfaces;
+        if (ublox_export_file) {
+            auto interface = interface::Interface::file(ublox_export_file.Get(), true);
+            export_interfaces.emplace_back(interface);
+        }
+
+        return UbloxOptions{port, std::move(interface), prm, readonly,
+                            std::move(export_interfaces)};
     } else {
         return UbloxOptions{};
     }
 }
 
-static NmeaOptions nmea_parse_options() {
+static std::unique_ptr<Interface> nmea_parse_serial() {
+    uint32_t baud_rate = 115200;
+    if (nmea_serial_baud_rate) {
+        if (nmea_serial_baud_rate.Get() < 0) {
+            throw args::ValidationError("nmea-serial-baud-rate must be positive");
+        }
+
+        baud_rate = static_cast<uint32_t>(nmea_serial_baud_rate.Get());
+    }
+
+    auto data_bits = DataBits::EIGHT;
+    if (nmea_serial_data_bits) {
+        switch (nmea_serial_data_bits.Get()) {
+        case 5: data_bits = DataBits::FIVE; break;
+        case 6: data_bits = DataBits::SIX; break;
+        case 7: data_bits = DataBits::SEVEN; break;
+        case 8: data_bits = DataBits::EIGHT; break;
+        default: throw args::ValidationError("Invalid data bits");
+        }
+    }
+
+    auto stop_bits = StopBits::ONE;
+    if (nmea_serial_stop_bits) {
+        switch (nmea_serial_stop_bits.Get()) {
+        case 1: stop_bits = StopBits::ONE; break;
+        case 2: stop_bits = StopBits::TWO; break;
+        default: throw args::ValidationError("Invalid stop bits");
+        }
+    }
+
+    auto parity_bit = ParityBit::NONE;
+    if (nmea_serial_parity_bits) {
+        if (nmea_serial_parity_bits.Get() == "none") {
+            parity_bit = ParityBit::NONE;
+        } else if (nmea_serial_parity_bits.Get() == "odd") {
+            parity_bit = ParityBit::ODD;
+        } else if (nmea_serial_parity_bits.Get() == "even") {
+            parity_bit = ParityBit::EVEN;
+        } else {
+            throw args::ValidationError("Invalid parity bits");
+        }
+    }
+
+    auto read_only = false;
+    if (receiver_readonly) {
+        read_only = true;
+    }
+
+    return std::unique_ptr<Interface>(interface::Interface::serial(
+        nmea_serial_device.Get(), baud_rate, data_bits, stop_bits, parity_bit, read_only));
+}
+
+static std::unique_ptr<Interface> nmea_parse_tcp() {
+    assert(nmea_tcp_ip_address);
+
+    if (!nmea_tcp_port) {
+        throw args::RequiredError("nmea-tcp-port");
+    }
+
+    return std::unique_ptr<Interface>(
+        Interface::tcp(nmea_tcp_ip_address.Get(), nmea_tcp_port.Get(), true /* reconnect */));
+}
+
+static std::unique_ptr<Interface> nmea_parse_udp() {
+    assert(nmea_udp_ip_address);
+
+    if (!nmea_udp_port) {
+        throw args::RequiredError("nmea-udp-port");
+    }
+
+    return std::unique_ptr<Interface>(
+        Interface::udp(nmea_udp_ip_address.Get(), nmea_udp_port.Get(), true /* reconnect */));
+}
+
+static std::unique_ptr<Interface> nmea_parse_interface() {
     if (nmea_serial_device) {
-        uint32_t baud_rate = 115200;
-        if (nmea_serial_baud_rate) {
-            if (nmea_serial_baud_rate.Get() < 0) {
-                throw args::ValidationError("nmea-serial-baud-rate must be positive");
-            }
+        return nmea_parse_serial();
+    } else if (nmea_tcp_ip_address) {
+        return nmea_parse_tcp();
+    } else if (nmea_udp_ip_address) {
+        return nmea_parse_udp();
+    } else {
+        throw args::RequiredError("No device/interface specified for NMEA receiver");
+    }
+}
 
-            baud_rate = static_cast<uint32_t>(nmea_serial_baud_rate.Get());
-        }
-
-        auto data_bits = DataBits::EIGHT;
-        if (nmea_serial_data_bits) {
-            switch (nmea_serial_data_bits.Get()) {
-            case 5: data_bits = DataBits::FIVE; break;
-            case 6: data_bits = DataBits::SIX; break;
-            case 7: data_bits = DataBits::SEVEN; break;
-            case 8: data_bits = DataBits::EIGHT; break;
-            default: throw args::ValidationError("Invalid data bits");
-            }
-        }
-
-        auto stop_bits = StopBits::ONE;
-        if (nmea_serial_stop_bits) {
-            switch (nmea_serial_stop_bits.Get()) {
-            case 1: stop_bits = StopBits::ONE; break;
-            case 2: stop_bits = StopBits::TWO; break;
-            default: throw args::ValidationError("Invalid stop bits");
-            }
-        }
-
-        auto parity_bit = ParityBit::NONE;
-        if (nmea_serial_parity_bits) {
-            if (nmea_serial_parity_bits.Get() == "none") {
-                parity_bit = ParityBit::NONE;
-            } else if (nmea_serial_parity_bits.Get() == "odd") {
-                parity_bit = ParityBit::ODD;
-            } else if (nmea_serial_parity_bits.Get() == "even") {
-                parity_bit = ParityBit::EVEN;
-            } else {
-                throw args::ValidationError("Invalid parity bits");
-            }
-        }
-
+static NmeaOptions nmea_parse_options() {
+    if (nmea_serial_device || nmea_tcp_ip_address || nmea_udp_ip_address) {
         std::vector<std::unique_ptr<interface::Interface>> nmea_export_interfaces;
         if (nmea_export_un) {
             auto interface = interface::Interface::unix_socket_stream(nmea_export_un.Get(), true);
@@ -852,11 +968,15 @@ static NmeaOptions nmea_parse_options() {
             nmea_export_interfaces.emplace_back(interface);
         }
 
-        auto interface = interface::Interface::serial(nmea_serial_device.Get(), baud_rate,
-                                                      data_bits, stop_bits, parity_bit);
+        if (nmea_export_file) {
+            auto interface = interface::Interface::file(nmea_export_file.Get(), true);
+            nmea_export_interfaces.emplace_back(interface);
+        }
+
+        auto interface = nmea_parse_interface();
         auto prm       = print_receiver_options_parse();
-        return NmeaOptions{std::unique_ptr<Interface>(interface), prm,
-                           std::move(nmea_export_interfaces)};
+        auto readonly  = receiver_readonly ? true : false;
+        return NmeaOptions{std::move(interface), prm, readonly, std::move(nmea_export_interfaces)};
     } else {
         return NmeaOptions{};
     }
@@ -869,7 +989,9 @@ static LocationInformationOptions parse_location_information_options() {
     location_information.altitude                       = 0;
     location_information.force                          = false;
     location_information.unlock_update_rate             = false;
-    location_information.convert_confidence_95_to_39    = false;
+    location_information.update_rate                    = 1000;
+    location_information.convert_confidence_95_to_68    = false;
+    location_information.output_ellipse_68              = false;
     location_information.override_horizontal_confidence = -1.0;
 
     if (li_force) {
@@ -878,6 +1000,13 @@ static LocationInformationOptions parse_location_information_options() {
 
     if (li_unlocked) {
         location_information.unlock_update_rate = true;
+    }
+
+    if(li_update_rate) {
+        location_information.update_rate = li_update_rate.Get();
+        if(location_information.update_rate < 10) {
+            throw args::ValidationError("Update rate cannot be less than 10 milliseconds");
+        }
     }
 
     if (li_enable) {
@@ -895,8 +1024,12 @@ static LocationInformationOptions parse_location_information_options() {
         }
     }
 
-    if (li_conf95to39) {
-        location_information.convert_confidence_95_to_39 = true;
+    if (li_conf95to39 || li_conf95to68) {
+        location_information.convert_confidence_95_to_68 = true;
+    }
+
+    if (li_output_ellipse_68) {
+        location_information.output_ellipse_68 = true;
     }
 
     if (li_override_horizontal_confidence) {
@@ -957,8 +1090,8 @@ static std::unique_ptr<Interface> control_parse_serial() {
         }
     }
 
-    return std::unique_ptr<Interface>(
-        Interface::serial(ctrl_serial_device.Get(), baud_rate, data_bits, stop_bits, parity_bit));
+    return std::unique_ptr<Interface>(Interface::serial(ctrl_serial_device.Get(), baud_rate,
+                                                        data_bits, stop_bits, parity_bit, false));
 }
 
 static std::unique_ptr<Interface> control_parse_tcp() {

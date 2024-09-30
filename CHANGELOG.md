@@ -1,6 +1,42 @@
 # Changelog
 
 ## [3.4.*]
+- You can now set the provide location information update rate with `--update-rate`. 
+- Added more options for SPARTN generation:
+    - `--no-code-bias-translate` to never translate between signal biases.
+    - `--no-code-bias-correction-shift` to never apply correction shift to code biases.
+    - `--no-phase-bias-translate` to never translate between signal biases.
+    - `--no-phase-bias-correction-shift` to never apply correction shift to phase biases.
+    - `--hydrostatic-in-zenith` to include hydrostatic delay residuals in the zenith residuals.
+    - `--no-gps` to skip generating GPS SPARTN messages.
+    - `--no-glonass` to skip generating GLONASS SPARTN messages.
+    - `--no-galileo` to skip generating Galileo SPARTN messages.
+    - `--beidou` to include generating BeiDou SPARTN messages.
+    - `--flip-grid-bitmask` to flip incoming LPP grid bitmask.
+- Deprecated the following options:
+    - `--iode-shift` removed as it was not used.
+    - `--ublox-clock-correction` is now the default behavior, use `--no-ublox-clock-correction` to disable it.
+    - `--force-continuity` is now the default behavior, use `--no-force-continuity` to disable it.
+    - `--average-zenith-delay` is now the default behavior, use `--no-average-zenith-delay` to disable it.
+- Removed `from_ellipse` and replaced it with:
+    - `to_ellipse_39` to create a horizontal accuracy ellipse with 39% confidence, will not rescale the axes.
+    - `to_ellipse_68` to create a horizontal accuracy ellipse with 68% confidence, will rescale the axes.
+- RTCM 1006 physical reference station indicator was incorrectly set to 0 for "virtual" stations and 1 for "physical" stations, instead of the other way around. 
+- RTCM 1005 physical reference station indicator was incorrectly set to 0 for "virtual" stations and 1 for "physical" stations, instead of the other way around.
+- Added options for `example-lpp`:
+    - `--no-gps` to skip generating GPS RTCM messages.
+    - `--no-glonass` to skip generating GLONASS RTCM messages.
+    - `--no-galileo` to skip generating Galileo RTCM messages.
+    - `--no-beidou` to skip generating BeiDou RTCM messages.
+- Added receiver option `--readonly` to prevent opening receiver serial port in write mode.
+- Added support to export NMEA sentences to file with `--nmea-export-file` command-line argument.
+- Added support to export UBX messages to file with `--ublox-export-file` command-line argument.
+
+## [3.4.11] 2024-09-26
+- Added support for UBX-RXM-RAWX messages.
+- Added support for $PQTMEPE messages.
+
+## [3.4.10] 2024-08-07
 - Added new control command `/IDENTITY` to provide the client with the IMSI, MSISDN, or IP address. See `CONTROL.md` for more information. 
 - Added new option `--wait-for-identity` to have the client wait for an identity before sending any assistance data requests.
 - Added new example `example-modem-ctrl` to demonstrate how to send control commands of cell IDs and IMSI to the client using the control interface.
@@ -10,6 +46,13 @@
     - `--slp-host-imsi` to use the IMSI to generate the SLP address.
     - `--slp-host-cell` to use the cell information to generate the SLP address.
 - Fixed a bug where the default `ura-override` value was initialized to 0 causing the SPARTN generator to always include it as "unknown".
+- Updated example location implementation in the LPP example to match the new version of the LocationInformation struct (#28 by Phillezi)
+- Added option `--lrf-message-id` to specify the RTCM message type to be used with `--format lrf-uper`.
+- Added TCP and UDP support when using the NMEA receiver.
+    - `--nmea-tcp` to specify the TCP ip address to connect to.
+    - `--nmea-tcp-port` to specify the TCP port to connect to.
+- The encoding of ha-uncertainty has been changed to the closed value and will never be encoded as 0.0m.
+- Fixed bug where std::stoull would throw an exception and crash the client
 
 ## [3.4.9] 2024-05-03
 - Added a few options to controll how SPARTN messages are generated:
